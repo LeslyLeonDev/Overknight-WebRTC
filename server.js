@@ -6,7 +6,7 @@ const ROOM_TTL_MS = 5 * 60 * 1000;
 const rooms = new Map();
 
 function makeRoom(code, hostSocket) {
-  return { code, host: hostSocket, guest: null, createdAt: Date.now() };
+  return { code, host: hostSocket, guest: null, createdAt: Date.now(), doneCount: 0 };
 }
 
 function safeSend(socket, obj) {
@@ -36,6 +36,10 @@ const wss = new WebSocketServer({ port: PORT });
 wss.on("connection", (socket) => {
   socket.roomCode = null;
   socket.role = null;
+  // Set once this socket has told us it's closing on purpose (WebRTC
+  // handshake succeeded, P2P channel is up, signalling is no longer
+  // needed) rather than dropping unexpectedly.
+  socket.closingCleanly = false;
 
   socket.on("message", (raw) => {
     let msg;
@@ -81,6 +85,30 @@ wss.on("connection", (socket) => {
       return;
     }
 
+    if (msg.type === "done") {
+      // Sent by a client right before it intentionally disconnects its
+      // signalling socket because WebRTC negotiation succeeded and the
+      // peer-to-peer channel is now up — the socket is about to close,
+      // but that close is expected and must NOT be treated as the other
+      // player leaving, and must NOT delete the room out from under a
+      // side that hasn't sent "done" yet.
+      socket.closingCleanly = true;
+
+      if (!socket.roomCode) return;
+      const room = rooms.get(socket.roomCode);
+      if (!room) return;
+
+      room.doneCount += 1;
+
+      // Once BOTH sides have confirmed they're done with signalling, the
+      // room has served its purpose and can be freed immediately instead
+      // of waiting on the 5-minute stale sweep.
+      if (room.doneCount >= 2) {
+        closeRoom(socket.roomCode);
+      }
+      return;
+    }
+
     // Every other message type (offer/answer/candidate/etc.) is treated as
     // an opaque signalling payload and simply relayed verbatim to the OTHER
     // side of the room — this server never parses WebRTC internals, so it
@@ -97,6 +125,22 @@ wss.on("connection", (socket) => {
     if (!socket.roomCode) return;
     const room = rooms.get(socket.roomCode);
     if (!room) return;
+
+    if (socket.closingCleanly) {
+      // Expected close after a successful handshake. Don't tell the other
+      // side "peer_left" (they didn't leave — they're happily connected
+      // over WebRTC now), and don't delete the room if the other side
+      // hasn't sent its own "done" yet — just remove this socket's slot.
+      if (socket.role === "host" && room.host === socket) {
+        room.host = null;
+      } else if (socket.role === "guest" && room.guest === socket) {
+        room.guest = null;
+      }
+      if (!room.host && !room.guest) {
+        closeRoom(socket.roomCode);
+      }
+      return;
+    }
 
     const other = socket.role === "host" ? room.guest : room.host;
     safeSend(other, { type: "peer_left" });
