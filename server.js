@@ -33,7 +33,23 @@ setInterval(cleanupStaleRooms, 60 * 1000);
 
 const wss = new WebSocketServer({ port: PORT });
 
+// Send a ping every 30s to keep reverse proxies from timing out idle host connections
+const heartbeat = setInterval(() => {
+  wss.clients.forEach((socket) => {
+    if (socket.isAlive === false) return socket.terminate();
+    socket.isAlive = false;
+    socket.ping();
+  });
+}, 30000);
+
+wss.on("close", () => clearInterval(heartbeat));
+
 wss.on("connection", (socket) => {
+  socket.isAlive = true;
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
+
   socket.roomCode = null;
   socket.role = null;
   // Set once this socket has told us it's closing on purpose (WebRTC
