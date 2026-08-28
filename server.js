@@ -3,10 +3,24 @@ const { WebSocketServer } = require("ws");
 const PORT = process.env.PORT || 8080;
 const ROOM_TTL_MS = 5 * 60 * 1000;
 
+// The lobby supports many players (up to 16), so a room must be able to
+// mediate several simultaneous guest handshakes and must stay alive for as
+// long as the host is around — not just until the first guest finishes.
+//
+// Each room tracks:
+//   host          - the host's signalling socket
+//   guestsById    - Map<peerId, socket>       (peer ID known, from an offer)
+//   pendingGuests - Set<socket>                (joined, no offer sent yet)
 const rooms = new Map();
 
 function makeRoom(code, hostSocket) {
-  return { code, host: hostSocket, guest: null, createdAt: Date.now(), doneCount: 0 };
+  return {
+    code,
+    host: hostSocket,
+    guestsById: new Map(),
+    pendingGuests: new Set(),
+    createdAt: Date.now(),
+  };
 }
 
 function safeSend(socket, obj) {
@@ -16,46 +30,41 @@ function safeSend(socket, obj) {
 }
 
 function closeRoom(code) {
-  const room = rooms.get(code);
-  if (!room) return;
   rooms.delete(code);
+}
+
+function roomIsEmpty(room) {
+  return room.guestsById.size === 0 && room.pendingGuests.size === 0;
 }
 
 function cleanupStaleRooms() {
   const now = Date.now();
   for (const [code, room] of rooms.entries()) {
-    if (now - room.createdAt > ROOM_TTL_MS && !room.guest) {
+    if (now - room.createdAt > ROOM_TTL_MS && roomIsEmpty(room)) {
       closeRoom(code);
     }
   }
 }
 setInterval(cleanupStaleRooms, 60 * 1000);
 
+// Once we learn a guest socket's Godot peer ID (from the first offer the
+// host sends it, or the first answer/candidate it sends back), move it
+// from pendingGuests into guestsById so future messages route directly.
+function resolveGuestId(room, socket, peerId) {
+  if (peerId === undefined || peerId === null) return;
+  if (!room.guestsById.has(peerId)) {
+    room.guestsById.set(peerId, socket);
+  }
+  room.pendingGuests.delete(socket);
+  socket.peerId = peerId;
+}
+
 const wss = new WebSocketServer({ port: PORT });
 
-// Send a ping every 30s to keep reverse proxies from timing out idle host connections
-const heartbeat = setInterval(() => {
-  wss.clients.forEach((socket) => {
-    if (socket.isAlive === false) return socket.terminate();
-    socket.isAlive = false;
-    socket.ping();
-  });
-}, 30000);
-
-wss.on("close", () => clearInterval(heartbeat));
-
 wss.on("connection", (socket) => {
-  socket.isAlive = true;
-  socket.on("pong", () => {
-    socket.isAlive = true;
-  });
-
   socket.roomCode = null;
   socket.role = null;
-  // Set once this socket has told us it's closing on purpose (WebRTC
-  // handshake succeeded, P2P channel is up, signalling is no longer
-  // needed) rather than dropping unexpectedly.
-  socket.closingCleanly = false;
+  socket.peerId = null;
 
   socket.on("message", (raw) => {
     let msg;
@@ -89,11 +98,12 @@ wss.on("connection", (socket) => {
         safeSend(socket, { type: "error", message: "Room not found." });
         return;
       }
-      if (room.guest) {
-        safeSend(socket, { type: "error", message: "Room already has a guest." });
+      if (!room.host || room.host.readyState !== room.host.OPEN) {
+        safeSend(socket, { type: "error", message: "The host is no longer connected." });
+        closeRoom(code);
         return;
       }
-      room.guest = socket;
+      room.pendingGuests.add(socket);
       socket.roomCode = code;
       socket.role = "guest";
       safeSend(socket, { type: "joined", code: code });
@@ -101,40 +111,55 @@ wss.on("connection", (socket) => {
       return;
     }
 
-    if (msg.type === "done") {
-      // Sent by a client right before it intentionally disconnects its
-      // signalling socket because WebRTC negotiation succeeded and the
-      // peer-to-peer channel is now up — the socket is about to close,
-      // but that close is expected and must NOT be treated as the other
-      // player leaving, and must NOT delete the room out from under a
-      // side that hasn't sent "done" yet.
-      socket.closingCleanly = true;
-
-      if (!socket.roomCode) return;
+    if (msg.type === "host_closing") {
+      // The host has decided to stop accepting new online joiners (e.g.
+      // the match started). Tell any still-pending guests so they don't
+      // hang waiting on a room that's about to disappear, then free it.
+      if (socket.role !== "host" || !socket.roomCode) return;
       const room = rooms.get(socket.roomCode);
       if (!room) return;
-
-      room.doneCount += 1;
-
-      // Once BOTH sides have confirmed they're done with signalling, the
-      // room has served its purpose and can be freed immediately instead
-      // of waiting on the 5-minute stale sweep.
-      if (room.doneCount >= 2) {
-        closeRoom(socket.roomCode);
-      }
+      for (const g of room.pendingGuests) safeSend(g, { type: "peer_left" });
+      for (const g of room.guestsById.values()) safeSend(g, { type: "peer_left" });
+      closeRoom(socket.roomCode);
       return;
     }
 
-    // Every other message type (offer/answer/candidate/etc.) is treated as
-    // an opaque signalling payload and simply relayed verbatim to the OTHER
-    // side of the room — this server never parses WebRTC internals, so it
-    // keeps working across any future Godot/plugin version differences.
+    if (msg.type === "done") {
+      // A guest sends this once its own handshake succeeded and it no
+      // longer needs signalling. This never affects the room or the host
+      // — more guests can keep joining the same room afterward.
+      if (!socket.roomCode) return;
+      const room = rooms.get(socket.roomCode);
+      if (!room) return;
+      if (socket.role === "guest" && socket.peerId !== null) {
+        room.guestsById.delete(socket.peerId);
+      }
+      room.pendingGuests.delete(socket);
+      return;
+    }
+
+    // offer / answer / candidate: opaque signalling payloads relayed
+    // between the host and the specific guest the message is about.
     if (!socket.roomCode) return;
     const room = rooms.get(socket.roomCode);
     if (!room) return;
 
-    const other = socket.role === "host" ? room.guest : room.host;
-    safeSend(other, msg);
+    if (socket.role === "host") {
+      const toPeerId = msg.to_peer_id;
+      let target = room.guestsById.get(toPeerId);
+      if (!target && room.pendingGuests.size > 0) {
+        // First message to a brand-new guest: it doesn't have a known
+        // peer ID yet, so target the oldest still-pending guest and
+        // remember the mapping from here on.
+        target = room.pendingGuests.values().next().value;
+        resolveGuestId(room, target, toPeerId);
+      }
+      safeSend(target, msg);
+    } else if (socket.role === "guest") {
+      const fromPeerId = msg.from_peer_id;
+      resolveGuestId(room, socket, fromPeerId);
+      safeSend(room.host, msg);
+    }
   });
 
   socket.on("close", () => {
@@ -142,25 +167,26 @@ wss.on("connection", (socket) => {
     const room = rooms.get(socket.roomCode);
     if (!room) return;
 
-    if (socket.closingCleanly) {
-      // Expected close after a successful handshake. Don't tell the other
-      // side "peer_left" (they didn't leave — they're happily connected
-      // over WebRTC now), and don't delete the room if the other side
-      // hasn't sent its own "done" yet — just remove this socket's slot.
-      if (socket.role === "host" && room.host === socket) {
-        room.host = null;
-      } else if (socket.role === "guest" && room.guest === socket) {
-        room.guest = null;
+    if (socket.role === "host") {
+      // The host leaving ends the whole online session for everyone
+      // still connected through signalling.
+      for (const g of room.pendingGuests) safeSend(g, { type: "peer_left" });
+      for (const g of room.guestsById.values()) safeSend(g, { type: "peer_left" });
+      closeRoom(socket.roomCode);
+    } else if (socket.role === "guest") {
+      // One guest dropping never affects the room or any other guest.
+      // Only tell the host if this guest hadn't already finished (a
+      // clean "done" already removed it from these collections).
+      const wasTracked = room.pendingGuests.has(socket) ||
+        (socket.peerId !== null && room.guestsById.get(socket.peerId) === socket);
+      room.pendingGuests.delete(socket);
+      if (socket.peerId !== null && room.guestsById.get(socket.peerId) === socket) {
+        room.guestsById.delete(socket.peerId);
       }
-      if (!room.host && !room.guest) {
-        closeRoom(socket.roomCode);
+      if (wasTracked) {
+        safeSend(room.host, { type: "peer_left", peer_id: socket.peerId });
       }
-      return;
     }
-
-    const other = socket.role === "host" ? room.guest : room.host;
-    safeSend(other, { type: "peer_left" });
-    closeRoom(socket.roomCode);
   });
 });
 
