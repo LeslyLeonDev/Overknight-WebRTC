@@ -3,22 +3,42 @@ const { WebSocketServer } = require("ws");
 const PORT = process.env.PORT || 8080;
 const ROOM_TTL_MS = 5 * 60 * 1000;
 
-// The lobby supports many players (up to 16), so a room must be able to
-// mediate several simultaneous guest handshakes and must stay alive for as
-// long as the host is around — not just until the first guest finishes.
+// --- Design notes -----------------------------------------------------
 //
-// Each room tracks:
-//   host          - the host's signalling socket
-//   guestsById    - Map<peerId, socket>       (peer ID known, from an offer)
-//   pendingGuests - Set<socket>                (joined, no offer sent yet)
-const rooms = new Map();
+// This follows the same protocol shape as Godot's own official WebRTC
+// signalling demo (godot-demo-projects/networking/webrtc_signaling):
+//
+//   * The SERVER assigns each connected socket a real numeric peer ID the
+//     moment it connects — the client never invents or guesses IDs.
+//   * Every relayed message (offer/answer/candidate) has its `id` field
+//     REWRITTEN by the server to the true sender's peer ID before being
+//     forwarded, so the receiving side always knows exactly who it came
+//     from with zero ambiguity — this is what earlier, hand-rolled
+//     versions of this server got wrong (it tried to guess which pending
+//     guest a message belonged to, which broke under any real-world
+//     timing variance).
+//   * A room ("lobby" in Godot's terms) is host + any number of guests.
+//     It lives as long as the host's socket is open. A guest joining,
+//     finishing its handshake, or leaving never affects the room itself
+//     or any other guest — only the host leaving (or explicitly closing
+//     the room) ends it for everyone.
+//
+// Extensive logging is included throughout specifically so connection
+// issues are diagnosable from the server logs alone.
+// ------------------------------------------------------------------------
+
+let _nextPeerId = 2; // 1 is reserved for the host, matching Godot's own convention
+const rooms = new Map(); // code -> Room
+
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
+}
 
 function makeRoom(code, hostSocket) {
   return {
     code,
     host: hostSocket,
-    guestsById: new Map(),
-    pendingGuests: new Set(),
+    guests: new Map(), // peerId -> socket
     createdAt: Date.now(),
   };
 }
@@ -26,58 +46,58 @@ function makeRoom(code, hostSocket) {
 function safeSend(socket, obj) {
   if (socket && socket.readyState === socket.OPEN) {
     socket.send(JSON.stringify(obj));
+    return true;
   }
+  return false;
 }
 
-function closeRoom(code) {
+function closeRoom(code, reason) {
+  const room = rooms.get(code);
+  if (!room) return;
+  log(`[room ${code}] closing (${reason})`);
   rooms.delete(code);
-}
-
-function roomIsEmpty(room) {
-  return room.guestsById.size === 0 && room.pendingGuests.size === 0;
 }
 
 function cleanupStaleRooms() {
   const now = Date.now();
   for (const [code, room] of rooms.entries()) {
-    if (now - room.createdAt > ROOM_TTL_MS && roomIsEmpty(room)) {
-      closeRoom(code);
+    if (now - room.createdAt > ROOM_TTL_MS && room.guests.size === 0) {
+      closeRoom(code, "stale, no guest ever joined");
     }
   }
 }
 setInterval(cleanupStaleRooms, 60 * 1000);
 
-// Once we learn a guest socket's Godot peer ID (from the first offer the
-// host sends it, or the first answer/candidate it sends back), move it
-// from pendingGuests into guestsById so future messages route directly.
-function resolveGuestId(room, socket, peerId) {
-  if (peerId === undefined || peerId === null) return;
-  if (!room.guestsById.has(peerId)) {
-    room.guestsById.set(peerId, socket);
-  }
-  room.pendingGuests.delete(socket);
-  socket.peerId = peerId;
-}
-
 const wss = new WebSocketServer({ port: PORT });
 
-wss.on("connection", (socket) => {
+wss.on("connection", (socket, req) => {
+  socket.peerId = _nextPeerId++;
   socket.roomCode = null;
-  socket.role = null;
-  socket.peerId = null;
+  socket.role = null; // "host" | "guest"
+
+  log(`[peer ${socket.peerId}] connected from ${req.socket.remoteAddress}`);
+  safeSend(socket, { type: "id", id: socket.peerId });
 
   socket.on("message", (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
     } catch (e) {
+      log(`[peer ${socket.peerId}] sent invalid JSON, ignoring`);
       return;
     }
 
-    if (msg.type === "host") {
+    const msgType = msg.type;
+    log(`[peer ${socket.peerId}] -> ${msgType}` + (socket.roomCode ? ` (room ${socket.roomCode})` : ""));
+
+    if (msgType === "host") {
       const code = String(msg.code || "").toUpperCase();
       if (!code) {
         safeSend(socket, { type: "error", message: "Missing room code." });
+        return;
+      }
+      if (socket.roomCode) {
+        safeSend(socket, { type: "error", message: "This connection is already hosting or joined a room." });
         return;
       }
       if (rooms.has(code)) {
@@ -87,107 +107,93 @@ wss.on("connection", (socket) => {
       rooms.set(code, makeRoom(code, socket));
       socket.roomCode = code;
       socket.role = "host";
-      safeSend(socket, { type: "hosting", code: code });
+      log(`[room ${code}] created by peer ${socket.peerId}`);
+      safeSend(socket, { type: "hosting", code: code, id: socket.peerId });
       return;
     }
 
-    if (msg.type === "join") {
+    if (msgType === "join") {
       const code = String(msg.code || "").toUpperCase();
       const room = rooms.get(code);
       if (!room) {
+        log(`[peer ${socket.peerId}] tried to join "${code}" — no such room`);
         safeSend(socket, { type: "error", message: "Room not found." });
         return;
       }
-      if (!room.host || room.host.readyState !== room.host.OPEN) {
-        safeSend(socket, { type: "error", message: "The host is no longer connected." });
-        closeRoom(code);
+      if (room.host.readyState !== room.host.OPEN) {
+        log(`[room ${code}] host socket is dead, closing stale room`);
+        closeRoom(code, "host socket dead on join attempt");
+        safeSend(socket, { type: "error", message: "Room not found." });
         return;
       }
-      room.pendingGuests.add(socket);
+      room.guests.set(socket.peerId, socket);
       socket.roomCode = code;
       socket.role = "guest";
-      safeSend(socket, { type: "joined", code: code });
-      safeSend(room.host, { type: "peer_joined", code: code });
+      log(`[room ${code}] peer ${socket.peerId} joined as guest (${room.guests.size} guest(s) now)`);
+      safeSend(socket, { type: "joined", code: code, id: socket.peerId, host_id: room.host.peerId });
+      safeSend(room.host, { type: "peer_connect", id: socket.peerId });
       return;
     }
 
-    if (msg.type === "host_closing") {
-      // The host has decided to stop accepting new online joiners (e.g.
-      // the match started). Tell any still-pending guests so they don't
-      // hang waiting on a room that's about to disappear, then free it.
-      if (socket.role !== "host" || !socket.roomCode) return;
-      const room = rooms.get(socket.roomCode);
-      if (!room) return;
-      for (const g of room.pendingGuests) safeSend(g, { type: "peer_left" });
-      for (const g of room.guestsById.values()) safeSend(g, { type: "peer_left" });
-      closeRoom(socket.roomCode);
-      return;
-    }
-
-    if (msg.type === "done") {
-      // A guest sends this once its own handshake succeeded and it no
-      // longer needs signalling. This never affects the room or the host
-      // — more guests can keep joining the same room afterward.
-      if (!socket.roomCode) return;
-      const room = rooms.get(socket.roomCode);
-      if (!room) return;
-      if (socket.role === "guest" && socket.peerId !== null) {
-        room.guestsById.delete(socket.peerId);
+    // offer / answer / candidate: opaque relay payloads. The `id` field is
+    // ALWAYS overwritten with the true sender's peer ID before relaying —
+    // the sender's own `id` field (the intended destination) is only used
+    // to pick where to send it, never trusted as "who this is from".
+    if (msgType === "offer" || msgType === "answer" || msgType === "candidate") {
+      if (!socket.roomCode) {
+        log(`[peer ${socket.peerId}] sent ${msgType} but isn't in a room, ignoring`);
+        return;
       }
-      room.pendingGuests.delete(socket);
-      return;
-    }
-
-    // offer / answer / candidate: opaque signalling payloads relayed
-    // between the host and the specific guest the message is about.
-    if (!socket.roomCode) return;
-    const room = rooms.get(socket.roomCode);
-    if (!room) return;
-
-    if (socket.role === "host") {
-      const toPeerId = msg.to_peer_id;
-      let target = room.guestsById.get(toPeerId);
-      if (!target && room.pendingGuests.size > 0) {
-        // First message to a brand-new guest: it doesn't have a known
-        // peer ID yet, so target the oldest still-pending guest and
-        // remember the mapping from here on.
-        target = room.pendingGuests.values().next().value;
-        resolveGuestId(room, target, toPeerId);
+      const room = rooms.get(socket.roomCode);
+      if (!room) {
+        log(`[peer ${socket.peerId}] sent ${msgType} but its room is gone, ignoring`);
+        return;
       }
+
+      const destId = msg.id;
+      let target = null;
+      if (socket.role === "host") {
+        target = room.guests.get(destId) || null;
+      } else if (socket.role === "guest") {
+        target = room.host;
+      }
+
+      if (!target) {
+        log(`[room ${socket.roomCode}] peer ${socket.peerId} tried to send ${msgType} to unknown peer ${destId}`);
+        return;
+      }
+
+      msg.id = socket.peerId; // rewrite to the TRUE sender, per Godot's own protocol
       safeSend(target, msg);
-    } else if (socket.role === "guest") {
-      const fromPeerId = msg.from_peer_id;
-      resolveGuestId(room, socket, fromPeerId);
-      safeSend(room.host, msg);
+      return;
     }
+
+    log(`[peer ${socket.peerId}] sent unknown message type "${msgType}", ignoring`);
   });
 
   socket.on("close", () => {
+    log(`[peer ${socket.peerId}] disconnected` + (socket.roomCode ? ` (was in room ${socket.roomCode} as ${socket.role})` : ""));
+
     if (!socket.roomCode) return;
     const room = rooms.get(socket.roomCode);
     if (!room) return;
 
     if (socket.role === "host") {
-      // The host leaving ends the whole online session for everyone
-      // still connected through signalling.
-      for (const g of room.pendingGuests) safeSend(g, { type: "peer_left" });
-      for (const g of room.guestsById.values()) safeSend(g, { type: "peer_left" });
-      closeRoom(socket.roomCode);
-    } else if (socket.role === "guest") {
-      // One guest dropping never affects the room or any other guest.
-      // Only tell the host if this guest hadn't already finished (a
-      // clean "done" already removed it from these collections).
-      const wasTracked = room.pendingGuests.has(socket) ||
-        (socket.peerId !== null && room.guestsById.get(socket.peerId) === socket);
-      room.pendingGuests.delete(socket);
-      if (socket.peerId !== null && room.guestsById.get(socket.peerId) === socket) {
-        room.guestsById.delete(socket.peerId);
+      for (const guestSocket of room.guests.values()) {
+        safeSend(guestSocket, { type: "peer_disconnect", id: socket.peerId });
       }
-      if (wasTracked) {
-        safeSend(room.host, { type: "peer_left", peer_id: socket.peerId });
+      closeRoom(socket.roomCode, `host (peer ${socket.peerId}) disconnected`);
+    } else if (socket.role === "guest") {
+      if (room.guests.delete(socket.peerId)) {
+        safeSend(room.host, { type: "peer_disconnect", id: socket.peerId });
+        log(`[room ${socket.roomCode}] guest peer ${socket.peerId} removed (${room.guests.size} guest(s) remain)`);
       }
     }
   });
+
+  socket.on("error", (err) => {
+    log(`[peer ${socket.peerId}] socket error: ${err.message}`);
+  });
 });
 
-console.log("Signalling server listening on port " + PORT);
+log(`Signalling server listening on port ${PORT}`);
